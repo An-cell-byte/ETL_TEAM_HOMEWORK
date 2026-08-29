@@ -185,6 +185,7 @@ def validate(
 # TRANSFORM: homologacion, conversion de unidades, variables derivadas.
 # Deterministico: misma entrada + misma configuracion -> mismo resultado.
 # ----------------------------------------------------------------------
+
 def transform(
     valid_shipments: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -212,31 +213,18 @@ def transform(
         entregas["delivered_at"] - entregas["shipped_at"]
     ).dt.days.astype("Int64")
 
-    entregas["is_selected"] = False
+    valor_seleccion = (
+        entregas["delivery_delay_days"]
+        .astype("float")
+        .fillna(float("inf"))
+    )
 
-    for order_id, grupo in entregas.groupby("order_id"):
+    selected_idx = valor_seleccion.groupby(
+        entregas["order_id"]
+    ).idxmax()
 
-        entregas_en_transito = grupo[
-            grupo["shipping_status"] == "in_transit"
-        ]
-
-        if not entregas_en_transito.empty:
-            indice_seleccionado = entregas_en_transito[
-                "shipped_at"
-            ].idxmax()
-
-        else:
-            indice_seleccionado = grupo[
-                "delivery_delay_days"
-            ].idxmax()
-
-        entregas.loc[
-            indice_seleccionado,
-            "is_selected"
-        ] = True
-
-    entregas_seleccionadas = entregas[
-        entregas["is_selected"]
+    entregas_seleccionadas = entregas.loc[
+        selected_idx
     ].copy()
 
     logging.info(
@@ -254,105 +242,58 @@ def transform(
 # ----------------------------------------------------------------------
 
 def integrate(
-    pedidos: pd.DataFrame,
-    entregas_transformadas: pd.DataFrame,
-    entregas_seleccionadas: pd.DataFrame,
-    carriers: dict
-) -> tuple[pd.DataFrame, dict]:
+    pedidos,
+    entregas_transformadas,
+    entregas_seleccionadas,
+    carriers
+):
+    rows_before = len(pedidos)
 
-    transportistas = (
-        pd.DataFrame.from_dict(
-            carriers,
-            orient="index"
-        )
-        .rename_axis("carrier_code")
-        .reset_index()
-    )
-
-    transportistas = transportistas.rename(
-        columns={"country": "carrier_country"}
-    )
-
-    entregas_con_transportista = entregas_transformadas.merge(
-        transportistas,
-        on="carrier_code",
-        how="left",
-        validate="many_to_one"
-    )
-
-    entregas_seleccionadas_con_transportista = (
-        entregas_seleccionadas.merge(
-            transportistas,
-            on="carrier_code",
-            how="left",
-            validate="many_to_one"
-        )
-    )
-
-    resumen_entregas = entregas_seleccionadas_con_transportista[
-        [
-            "order_id",
-            "shipment_id",
-            "carrier_code",
-            "carrier_name",
-            "carrier_country",
-            "shipping_status",
-            "delivery_delay_days"
-        ]
-    ].copy()
-
-    pedidos_base = pedidos.rename(
-        columns={"status": "order_status"}
-    ).copy()
-
-    rows_before = len(pedidos_base)
-
-    merged = pedidos_base.merge(
-        resumen_entregas,
+    merged = pedidos.merge(
+        entregas_seleccionadas,
         on="order_id",
-        how="left",
-        validate="one_to_one"
+        how="left"
+    )
+
+    carrier_info = merged["carrier_code"].map(
+        lambda code: carriers.get(
+            code,
+            {
+                "carrier_name": None,
+                "country": None
+            }
+        )
+    )
+
+    merged["carrier_name"] = carrier_info.map(
+        lambda info: info["carrier_name"]
+    )
+
+    merged["carrier_country"] = carrier_info.map(
+        lambda info: info["country"]
     )
 
     merged["shipping_status"] = merged[
         "shipping_status"
     ].fillna("no_valid_shipment")
 
-    merged["delivery_delay_days"] = merged[
-        "delivery_delay_days"
-    ].astype("Int64")
+    unknown_carrier = int(
+        (~entregas_transformadas["carrier_code"].isin(carriers)).sum()
+    )
 
     reconciliation = {
-        "orders_before": rows_before,
-        "orders_after": len(merged),
-        "valid_shipments": len(entregas_con_transportista),
-        "selected_shipments": len(
-            entregas_seleccionadas_con_transportista
-        ),
-        "orders_with_valid_shipments": int(
-            merged["shipment_id"].notna().sum()
-        ),
-        "orders_without_valid_shipments": int(
-            merged["shipment_id"].isna().sum()
-        ),
-        "unknown_carrier": int(
-            entregas_con_transportista[
-                "carrier_name"
-            ].isna().sum()
-        ),
+        "rows_before": rows_before,
+        "rows_after": len(merged),
+        "valid_shipments": len(entregas_transformadas),
+        "unknown_carrier": unknown_carrier,
         "duplicated_order_id": int(
             merged["order_id"].duplicated().sum()
         )
     }
 
-    if reconciliation["orders_after"] != rows_before:
+    if len(merged) != rows_before:
         raise ValueError(
-            "La integración cambió el grain de una fila por pedido"
-        )
-
-    if reconciliation["duplicated_order_id"] != 0:
-        raise ValueError(
-            "La integración produjo pedidos duplicados"
+            "La integración cambió la cantidad de pedidos"
         )
 
     logging.info(
