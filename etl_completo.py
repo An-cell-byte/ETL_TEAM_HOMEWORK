@@ -186,74 +186,181 @@ def validate(
 # Deterministico: misma entrada + misma configuracion -> mismo resultado.
 # ----------------------------------------------------------------------
 def transform(
-    valid_vehicles: pd.DataFrame,
-    valid_prices: pd.DataFrame,
-    aliases: dict,
-    current_year: int,
+    valid_shipments: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    vehicles = valid_vehicles.copy()
-    vehicles["brand"] = vehicles["brand"].str.strip().str.lower().map(aliases).fillna(vehicles["brand"])
-    vehicles["model"] = vehicles["model"].astype(str).str.strip().str.title()
 
-    is_miles = vehicles["mileage_unit"] == "mi"
-    vehicles.loc[is_miles, "mileage"] = vehicles.loc[is_miles, "mileage"] * MILES_TO_KM
-    vehicles["mileage_unit"] = "km"
+    entregas = valid_shipments.copy()
 
-    vehicles["vehicle_age"] = current_year - vehicles["year"]
+    entregas["shipped_at"] = pd.to_datetime(
+        entregas["shipped_at"],
+        errors="coerce"
+    )
 
-    # Un vehiculo puede tener varias observaciones de precio (1:N):
-    # se selecciona la mas reciente por vehicle_id.
-    prices = valid_prices.copy()
-    prices["observed_at"] = pd.to_datetime(prices["observed_at"])
-    latest_idx = prices.groupby("vehicle_id")["observed_at"].idxmax()
-    latest_prices = prices.loc[latest_idx, ["vehicle_id", "price", "currency", "observed_at"]]
+    entregas["delivered_at"] = pd.to_datetime(
+        entregas["delivered_at"],
+        errors="coerce"
+    )
+
+    entregas["shipping_status"] = "delivered"
+
+    entregas.loc[
+        entregas["delivered_at"].isna(),
+        "shipping_status"
+    ] = "in_transit"
+
+    entregas["delivery_delay_days"] = (
+        entregas["delivered_at"] - entregas["shipped_at"]
+    ).dt.days.astype("Int64")
+
+    entregas["is_selected"] = False
+
+    for order_id, grupo in entregas.groupby("order_id"):
+
+        entregas_en_transito = grupo[
+            grupo["shipping_status"] == "in_transit"
+        ]
+
+        if not entregas_en_transito.empty:
+            indice_seleccionado = entregas_en_transito[
+                "shipped_at"
+            ].idxmax()
+
+        else:
+            indice_seleccionado = grupo[
+                "delivery_delay_days"
+            ].idxmax()
+
+        entregas.loc[
+            indice_seleccionado,
+            "is_selected"
+        ] = True
+
+    entregas_seleccionadas = entregas[
+        entregas["is_selected"]
+    ].copy()
 
     logging.info(
-        "TRANSFORM: %s vehiculos transformados | %s precios mas recientes (de %s observaciones)",
-        len(vehicles),
-        len(latest_prices),
-        len(prices),
+        "TRANSFORM: %s entregas transformadas | %s seleccionadas",
+        len(entregas),
+        len(entregas_seleccionadas)
     )
-    return vehicles, latest_prices
+
+    return entregas, entregas_seleccionadas
 
 
 # ----------------------------------------------------------------------
 # INTEGRATE: combina vehiculos + ultimo precio + info de fabricante.
 # Se valida la cardinalidad (1:1 esperado) mediante reconciliation.
 # ----------------------------------------------------------------------
+
 def integrate(
-    vehicles: pd.DataFrame, latest_prices: pd.DataFrame, manufacturers: dict
+    pedidos: pd.DataFrame,
+    entregas_transformadas: pd.DataFrame,
+    entregas_seleccionadas: pd.DataFrame,
+    carriers: dict
 ) -> tuple[pd.DataFrame, dict]:
-    rows_before = len(vehicles)
-    merged = vehicles.merge(latest_prices, on="vehicle_id", how="left")
 
-    if len(merged) != rows_before:
-        raise ValueError(
-            f"Cardinalidad inesperada en integrate: {rows_before} vehiculos -> {len(merged)} filas"
+    transportistas = (
+        pd.DataFrame.from_dict(
+            carriers,
+            orient="index"
         )
-
-    manufacturer_info = merged["brand"].map(
-        lambda brand: manufacturers.get(brand, {"country": None, "segment": None})
+        .rename_axis("carrier_code")
+        .reset_index()
     )
-    merged["manufacturer_country"] = manufacturer_info.map(lambda info: info["country"])
-    merged["manufacturer_segment"] = manufacturer_info.map(lambda info: info["segment"])
+
+    transportistas = transportistas.rename(
+        columns={"country": "carrier_country"}
+    )
+
+    entregas_con_transportista = entregas_transformadas.merge(
+        transportistas,
+        on="carrier_code",
+        how="left",
+        validate="many_to_one"
+    )
+
+    entregas_seleccionadas_con_transportista = (
+        entregas_seleccionadas.merge(
+            transportistas,
+            on="carrier_code",
+            how="left",
+            validate="many_to_one"
+        )
+    )
+
+    resumen_entregas = entregas_seleccionadas_con_transportista[
+        [
+            "order_id",
+            "shipment_id",
+            "carrier_code",
+            "carrier_name",
+            "carrier_country",
+            "shipping_status",
+            "delivery_delay_days"
+        ]
+    ].copy()
+
+    pedidos_base = pedidos.rename(
+        columns={"status": "order_status"}
+    ).copy()
+
+    rows_before = len(pedidos_base)
+
+    merged = pedidos_base.merge(
+        resumen_entregas,
+        on="order_id",
+        how="left",
+        validate="one_to_one"
+    )
+
+    merged["shipping_status"] = merged[
+        "shipping_status"
+    ].fillna("no_valid_shipment")
+
+    merged["delivery_delay_days"] = merged[
+        "delivery_delay_days"
+    ].astype("Int64")
 
     reconciliation = {
-        "rows_before": rows_before,
-        "rows_after": len(merged),
-        "matched_with_price": int(merged["price"].notna().sum()),
-        "unmatched_price": int(merged["price"].isna().sum()),
-        "duplicated_vehicle_id": int(merged["vehicle_id"].duplicated().sum()),
-        "unknown_brand": int(merged["manufacturer_country"].isna().sum()),
+        "orders_before": rows_before,
+        "orders_after": len(merged),
+        "valid_shipments": len(entregas_con_transportista),
+        "selected_shipments": len(
+            entregas_seleccionadas_con_transportista
+        ),
+        "orders_with_valid_shipments": int(
+            merged["shipment_id"].notna().sum()
+        ),
+        "orders_without_valid_shipments": int(
+            merged["shipment_id"].isna().sum()
+        ),
+        "unknown_carrier": int(
+            entregas_con_transportista[
+                "carrier_name"
+            ].isna().sum()
+        ),
+        "duplicated_order_id": int(
+            merged["order_id"].duplicated().sum()
+        )
     }
-    logging.info("INTEGRATE / RECONCILIATION: %s", reconciliation)
 
-    unknown_brands = sorted(set(merged.loc[merged["manufacturer_country"].isna(), "brand"]))
-    for brand in unknown_brands:
-        logging.warning("Marca sin informacion de fabricante en cache: se llamaria GET /manufacturers/%s", brand)
+    if reconciliation["orders_after"] != rows_before:
+        raise ValueError(
+            "La integración cambió el grain de una fila por pedido"
+        )
+
+    if reconciliation["duplicated_order_id"] != 0:
+        raise ValueError(
+            "La integración produjo pedidos duplicados"
+        )
+
+    logging.info(
+        "INTEGRATE / RECONCILIATION: %s",
+        reconciliation
+    )
 
     return merged, reconciliation
-
 
 # ----------------------------------------------------------------------
 # QUALITY GATE: no se carga solo porque el proceso no lanzo una excepcion.
