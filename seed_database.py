@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+import pandas as pd
 
 
 DB_PATH = Path(__file__).resolve().parent / "data" / "pedidos.db"
@@ -42,6 +43,26 @@ def main() -> None:
         conn.commit()
 
     print(f"Sembrados {len(ORDERS)} pedidos en {DB_PATH}")
+    
+# Creamos el Archivo .json:
+
+STORAGE_ADDRESS = Path(__file__).resolve().parent / "Data"
+STORAGE_ADDRESS.mkdir(parents=True, exist_ok=True)  # Crea la carpeta Data si no existe
+
+json_path = STORAGE_ADDRESS / "carriers.json"
+
+datos_carriers = {
+    "DHL": {"carrier_name": "DHL Express", "country": "Germany"},
+    "FDX": {"carrier_name": "FedEx", "country": "USA"}
+}
+
+dfjson = pd.DataFrame.from_dict(datos_carriers, orient='index')
+
+carpeta_destino = Path("Data") # Cambia "Data" por la ruta de la carpeta que prefieras
+carpeta_destino.mkdir(parents=True, exist_ok=True)
+
+ruta_archivo = carpeta_destino / "carriers.json"
+dfjson.to_json(ruta_archivo, orient='index', indent=4, force_ascii=False)
 
 
 if __name__ == "__main__":
