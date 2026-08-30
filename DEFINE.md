@@ -1,6 +1,6 @@
-# Elegimos la Casuística A2
+# Elegimos la Casuística A2 
 
-## Qué representa cada fuente?
+## ¿Qué representa cada fuente?
 
 - La de sqlite `orders.db` esta tiene toda la información principal de cada pedido y su estado.
 - La de csv `shipments.csv`es la que contiene los paquetes enviados. Un pedido puede aparecer varias veces porque puede tener más de un paquete.
