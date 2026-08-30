@@ -16,7 +16,7 @@ La business key es `order_id`. Ya existe en `orders` y en `shipments.csv`, por l
 
 ## Refresh strategy
 
-Elegimos usar un refresh full para que en cada ejecución se vuelven a leer todas las fuentes reconstruyendo `orders_curated`. Esto tiene sentido porque el volumen de datos de este ejercicio es pequeño y `shipments.csv` no tiene un campo que permita saber si se modificaron filas
+Elegimos usar un refresh incremental. En cada ejecución solo procesamos los pedidos nuevos o los que tuvieron cambios. La columna `updated_at` ayuda a identificar los pedidos modificados y `order_id` se usa para actualizar la fila correcta. Al cargar los resultados se hace un UPSERT: si el pedido no existe se agrega y, si ya existe, se actualiza. Así no es necesario reconstruir toda la tabla `orders_curated` en cada corrida.
 
 ## Contrato de datos
 
