@@ -3,7 +3,8 @@ from pathlib import Path
 import pandas as pd
 
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "orders.db"
+DB_PATH = Path(__file__).resolve().parent / "Data" / "orders.db"
+WATERMARK_PATH = Path(__file__).resolve().parent / "Data" / "orders_watermark.json"
 
 ORDERS = [
     # order_id, customer_id, order_date, status, updated_at
@@ -19,6 +20,8 @@ def main() -> None:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     if DB_PATH.exists():
         DB_PATH.unlink()
+    if WATERMARK_PATH.exists():
+        WATERMARK_PATH.unlink()
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(

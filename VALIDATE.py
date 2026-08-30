@@ -10,7 +10,7 @@ import sqlite3
 
 import pandas as pd
 
-from EXTRACT_STAGE import ETLConfig, extract, load_config, stage
+from EXTRACT_STAGE import ETLConfig, extract, load_config, read_watermark, stage
 
 
 logging.basicConfig(
@@ -62,7 +62,11 @@ def validate(
 
         reasons.append(";".join(row_reasons))
 
-    shipments["rejection_reason"] = reasons
+    shipments["rejection_reason"] = pd.Series(
+        reasons,
+        index=shipments.index,
+        dtype="string",
+    )
     valid_shipments = shipments[shipments["rejection_reason"] == ""].copy()
     quarantined_shipments = shipments[shipments["rejection_reason"] != ""].copy()
 
@@ -116,7 +120,7 @@ def quality_gate(reconciliation: dict, config: ETLConfig) -> dict:
 
 
 def save_quarantine(quarantined_shipments: pd.DataFrame, config: ETLConfig) -> None:
-    """Reemplaza la cuarentena del refresh full con los rechazos actuales."""
+    """Agrega a cuarentena los rechazos del lote incremental actual."""
     quarantine_columns = [
         "order_id",
         "shipment_id",
@@ -128,10 +132,11 @@ def save_quarantine(quarantined_shipments: pd.DataFrame, config: ETLConfig) -> N
         "batch_id",
         "ingested_at",
     ]
-    with sqlite3.connect(config.database_path) as conn:
-        quarantined_shipments[quarantine_columns].to_sql(
-            "orders_quarantine", conn, if_exists="replace", index=False
-        )
+    if not quarantined_shipments.empty:
+        with sqlite3.connect(config.database_path) as conn:
+            quarantined_shipments[quarantine_columns].to_sql(
+                "orders_quarantine", conn, if_exists="append", index=False
+            )
     logging.info(
         "QUARANTINE: %s registros guardados en orders_quarantine",
         len(quarantined_shipments),
@@ -140,7 +145,8 @@ def save_quarantine(quarantined_shipments: pd.DataFrame, config: ETLConfig) -> N
 
 def main() -> None:
     config = load_config()
-    orders, shipments, carriers = extract(config)
+    watermark = read_watermark(config.watermark_path)
+    orders, shipments, carriers = extract(config, watermark)
     batch_id = f"VALIDATE_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S')}"
     staged_orders, staged_shipments, staged_carriers = stage(
         orders, shipments, carriers, batch_id

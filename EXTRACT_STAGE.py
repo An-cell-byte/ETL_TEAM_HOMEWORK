@@ -1,9 +1,8 @@
 """Ejecuta las etapas DEFINE, EXTRACT y STAGE del ETL de pedidos.
 
 Las fuentes son ``orders.db`` (SQLite), ``shipments.csv`` y
-``carriers.json``. El refresh definido para este ejercicio es full, por lo
-que el watermark se conserva como metadata de la ejecución, pero no limita
-la extracción.
+``carriers.json``. El refresh definido para este ejercicio es incremental:
+``updated_at`` y el watermark identifican pedidos nuevos o modificados.
 """
 
 import json
@@ -28,7 +27,7 @@ logging.basicConfig(
 
 # ----------------------------------------------------------------------
 # DEFINE: contrato del pipeline según DEFINE.md.
-# Grain=pedido, business key=order_id y refresh full.
+# Grain=pedido, business key=order_id y refresh incremental.
 # ----------------------------------------------------------------------
 @dataclass(frozen=True)
 class ETLConfig:
@@ -53,7 +52,7 @@ def load_config() -> ETLConfig:
         output_table="orders_curated",
         grain="un pedido",
         business_key="order_id",
-        refresh_strategy="full",
+        refresh_strategy="incremental",
         quality_thresholds={
             "unknown_carrier_rate_max": 0.25,
             "invalid_date_rate_max": 0.20,
@@ -62,7 +61,7 @@ def load_config() -> ETLConfig:
 
 
 def read_watermark(path: Path) -> str | None:
-    """Lee el watermark anterior; en refresh full no se usa para filtrar."""
+    """Lee la última fecha de actualización procesada."""
     if not path.exists():
         return None
     with path.open(encoding="utf-8") as file:
@@ -77,20 +76,30 @@ def write_watermark(path: Path, value: str) -> None:
 
 
 # ----------------------------------------------------------------------
-# EXTRACT: cada fuente se lee por separado. Se extraen todas las filas
-# porque DEFINE.md establece una estrategia de refresh full.
+# EXTRACT: se filtran pedidos mediante updated_at. Los envíos del lote son
+# los que pertenecen a esos pedidos; el catálogo siempre se lee completo.
 # ----------------------------------------------------------------------
 def extract(
     config: ETLConfig, watermark: str | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    del watermark  # El refresh full no aplica filtro incremental.
-
     with sqlite3.connect(config.database_path) as conn:
-        orders = pd.read_sql_query("SELECT * FROM orders", conn)
+        if watermark is None:
+            orders = pd.read_sql_query("SELECT * FROM orders", conn)
+        else:
+            orders = pd.read_sql_query(
+                "SELECT * FROM orders WHERE updated_at > :watermark",
+                conn,
+                params={"watermark": watermark},
+            )
 
     shipments = pd.read_csv(config.shipments_path, dtype=str).replace(
         {"": pd.NA}
     )
+    if watermark is not None:
+        incremental_order_ids = set(orders["order_id"].astype(str))
+        shipments = shipments[
+            shipments["order_id"].isin(incremental_order_ids)
+        ].copy()
 
     with config.carriers_path.open(encoding="utf-8") as file:
         carriers_raw = json.load(file)
@@ -172,9 +181,14 @@ def main() -> None:
         orders, shipments, carriers, batch_id
     )
 
-    watermark_after = str(staged_orders["updated_at"].max())
-    write_watermark(config.watermark_path, watermark_after)
-    logging.info("Watermark actualizado: %s", watermark_after)
+    if staged_orders.empty:
+        logging.info("Sin pedidos nuevos o modificados")
+    else:
+        watermark_candidate = str(staged_orders["updated_at"].max())
+        logging.info(
+            "Watermark candidato=%s; se actualizará después de un LOAD exitoso",
+            watermark_candidate,
+        )
 
     print(
         f"STAGE listo: orders={len(staged_orders)}, "
