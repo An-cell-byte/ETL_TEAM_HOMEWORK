@@ -105,6 +105,7 @@ def extract(config: ETLConfig, watermark: str) -> tuple[pd.DataFrame, pd.DataFra
 # STAGE: se conserva evidencia de origen (source_system, batch_id,
 # ingested_at) antes de aplicar cualquier regla de negocio.
 # ----------------------------------------------------------------------
+
 def stage(vehicles: pd.DataFrame, market_prices: pd.DataFrame, batch_id: str) -> tuple[pd.DataFrame, pd.DataFrame]:
     ingested_at = pd.Timestamp.now("UTC").isoformat()
 
@@ -126,6 +127,7 @@ def stage(vehicles: pd.DataFrame, market_prices: pd.DataFrame, batch_id: str) ->
 # VALIDATE: aplica el contrato de datos. Los registros invalidos van a
 # cuarentena con su razon, no se descartan silenciosamente.
 # ----------------------------------------------------------------------
+
 def validate(
     staged_vehicles: pd.DataFrame,
     staged_prices: pd.DataFrame,
