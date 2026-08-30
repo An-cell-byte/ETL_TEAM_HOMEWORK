@@ -29,9 +29,9 @@ def main() -> None:
             CREATE TABLE orders (
                 order_id INTEGER PRIMARY KEY,
                 customer_id INTEGER NOT NULL,
-                order_date DATE NOT NULL,
+                order_date TEXT NOT NULL,
                 status TEXT NOT NULL,
-                updated_at TIMESTAMP NOT NULL
+                updated_at TEXT NOT NULL
             )
             """
         )
