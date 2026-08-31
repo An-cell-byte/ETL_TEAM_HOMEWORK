@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 
 
-DB_PATH = Path(__file__).resolve().parent / "data" / "pedidos.db"
+DB_PATH = Path(__file__).resolve().parent / "data" / "orders.db"
 
 ORDERS = [
     # order_id, customer_id, order_date, status, updated_at
@@ -83,7 +83,7 @@ def crear_csv():
     }
 
     df_csv = pd.DataFrame(datos_envios)
-    df_csv.to_csv(STORAGE_ADDRESS / "shipments.csv", index=False)
+    df_csv.to_csv(carpeta_destino / "shipments.csv", index=False)
     print(df_csv)
 
 

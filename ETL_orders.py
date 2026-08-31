@@ -24,7 +24,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 
-
 # ----------------------------------------------------------------------
 # DEFINE: contrato del pipeline según DEFINE.md.
 # Grain=pedido, business key=order_id y refresh incremental.
@@ -37,6 +36,7 @@ class ETLConfig:
     carriers_path: Path
     watermark_path: Path
     output_table: str
+    audit_table: str
     grain: str
     business_key: str
     refresh_strategy: str
@@ -51,6 +51,7 @@ def load_config() -> ETLConfig:
         carriers_path=DATA_DIR / "carriers.json",
         watermark_path=DATA_DIR / "orders_watermark.json",
         output_table="orders_curated",
+        audit_table="etl_audit",
         grain="un pedido",
         business_key="order_id",
         refresh_strategy="incremental",
@@ -112,7 +113,7 @@ def extract(
     )
 
     logging.info(
-        "EXTRACT: orders.db= %s pedidos | shipments.csv= %s paquetes | carriers.json= %s transportistas",
+        "EXTRACT: orders.db= %s pedidos | shipments.csv= %s paquetes | carriers.json= `%s transportistas",
         len(orders),
         len(shipments),
         len(carriers),
@@ -240,23 +241,6 @@ def validate(
     return valid_shipments, quarantined_shipments, reconciliation
 
 
-def quality_gate(reconciliation: dict, config: ETLConfig) -> dict:
-    """Comprueba los umbrales sin rechazar transportistas desconocidos."""
-    metrics = {
-        "unknown_carrier_rate": round(reconciliation["unknown_carrier_rate"], 2),
-        "invalid_date_rate": round(reconciliation["invalid_date_rate"], 2),
-    }
-    failures = []
-    if metrics["unknown_carrier_rate"] > config.quality_thresholds["unknown_carrier_rate_max"]:
-        failures.append("unknown_carrier_rate")
-    if metrics["invalid_date_rate"] > config.quality_thresholds["invalid_date_rate_max"]:
-        failures.append("invalid_date_rate")
-
-    result = {"status": "FAIL" if failures else "PASS", "metrics": metrics, "failures": failures}
-    logging.info("QUALITY GATE: %s", result)
-    return result
-
-
 def save_quarantine(quarantined_shipments: pd.DataFrame, config: ETLConfig) -> None:
     """Agrega a cuarentena los rechazos del lote incremental actual."""
     quarantine_columns = [
@@ -279,13 +263,8 @@ def save_quarantine(quarantined_shipments: pd.DataFrame, config: ETLConfig) -> N
         "QUARANTINE: %s registros guardados en orders_quarantine",
         len(quarantined_shipments),
     )
-    
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] %(levelname)s %(message)s",
-    datefmt="%H:%M:%S",
-)
 
+# ------------------------------------------- Transform -------------------------------------------
 
 def transform(
     valid_shipments: pd.DataFrame,
@@ -408,138 +387,255 @@ def integrate(
     logging.info("INTEGRATE / RECONCILIATION: %s", reconciliation)
     return orders_curated, reconciliation
 
+def quality_gate(reconciliation: dict, config: ETLConfig) -> dict:
+    """Comprueba los umbrales sin rechazar transportistas desconocidos."""
+    metrics = {
+        "unknown_carrier_rate": round(reconciliation["unknown_carrier_rate"], 2),
+        "invalid_date_rate": round(reconciliation["invalid_date_rate"], 2),
+    }
+    failures = []
+    if metrics["unknown_carrier_rate"] > config.quality_thresholds["unknown_carrier_rate_max"]:
+        failures.append("unknown_carrier_rate")
+    if metrics["invalid_date_rate"] > config.quality_thresholds["invalid_date_rate_max"]:
+        failures.append("invalid_date_rate")
 
+    result = {"status": "FAIL" if failures else "PASS", "metrics": metrics, "failures": failures}
+    logging.info("QUALITY GATE: %s", result)
+    return result
+
+# ------------------------------------------- LOAD -------------------------------------------
+
+def load(
+    config: ETLConfig,
+    orders_curated: pd.DataFrame,
+    quarantined_shipments: pd.DataFrame,
+    batch_id: str,
+) -> tuple[int, int]:
+
+    """Cargamos los datos mediante un UPSERT idempotente"""
+    
+    if orders_curated.empty:
+        logging.info("LOAD: No hay datos para procesar.")
+        return 0, 0
+
+    inserted = 0
+    updated = 0
+
+    with sqlite3.connect(config.database_path) as conn:
+        
+        # Definimos la estructura de la tabla curada:
+        
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {config.output_table} (
+                order_id INTEGER PRIMARY KEY,
+                shipping_status TEXT,
+                delivery_delay_days INTEGER,
+                carrier_name TEXT,
+                updated_at TEXT,
+                batch_id TEXT
+            )
+            """
+        )
+
+        try:
+            with conn:
+                for _, row in orders_curated.iterrows():
+                    cur = conn.execute(
+                        f"SELECT 1 FROM {config.output_table} WHERE order_id = ?",
+                        (int(row["order_id"]),),
+                    )
+                    exists = cur.fetchone() is not None
+
+                    conn.execute(
+                        f"""
+                        INSERT INTO {config.output_table}
+                        (order_id, shipping_status, delivery_delay_days, carrier_name, updated_at, batch_id)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(order_id) DO UPDATE SET
+                            shipping_status = excluded.shipping_status,
+                            delivery_delay_days = excluded.delivery_delay_days,
+                            carrier_name = excluded.carrier_name,
+                            updated_at = excluded.updated_at,
+                            batch_id = excluded.batch_id
+                        """,
+                        (
+                            int(row["order_id"]),
+                            row["shipping_status"],
+                            None
+                            if pd.isna(row["delivery_delay_days"])
+                            else int(row["delivery_delay_days"]),
+                            row["carrier_name"]
+                            if pd.notna(row["carrier_name"])
+                            else None,
+                            str(row["updated_at"]),
+                            batch_id,
+                        ),
+                    )
+
+                    if exists:
+                        updated += 1
+                    else:
+                        inserted += 1
+
+            if not quarantined_shipments.empty:
+                save_quarantine(quarantined_shipments, config)
+
+        except Exception as e:
+            logging.error(
+                "LOAD: Error durante la transacción SQL, ejecutando ROLLBACK. Detalle: %s",
+                e,
+            )
+            raise
+
+    logging.info(
+        "LOAD: %s insertados, %s actualizados (UPSERT) en la tabla %s",
+        inserted,
+        updated,
+        config.output_table,
+    )
+
+    watermark_candidate = str(orders_curated["updated_at"].max())
+    write_watermark(config.watermark_path, watermark_candidate)
+
+    return inserted, updated
  
-# ------------------------------------------- Funciones main() -------------------------------------------
+ # ------------------------------------------- AUDIT -------------------------------------------
+ 
+def audit(config: ETLConfig,
+        run_id: str,
+        started_at: str,
+        finished_at: str,
+        watermark_before: str | None,
+        watermark_after: str | None,
+        counts: dict[str, int],
+        status: str) -> None:
+    
+    with sqlite3.connect(config.database_path) as conn:
+        conn.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {config.audit_table} (
+                run_id TEXT PRIMARY KEY,
+                started_at TEXT,
+                finished_at TEXT,
+                watermark_before TEXT,
+                watermark_after TEXT,
+                source_orders INTEGER,
+                source_shipments INTEGER,
+                valid_shipments INTEGER,
+                quarantined_shipments INTEGER,
+                inserted_orders INTEGER,
+                updated_orders INTEGER,
+                status TEXT
+            )
+            """
+        )
+        
+    with conn:
+        conn.execute(
+            f"""
+            INSERT OR REPLACE INTO {config.audit_table} (
+                run_id, started_at, finished_at, watermark_before, watermark_after,
+                source_orders, source_shipments, valid_shipments, quarantined_shipments,
+                inserted_orders, updated_orders, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+        (
+            run_id,
+            started_at,
+            finished_at,
+            watermark_before,
+            watermark_after,
+            counts.get("source_orders", 0),
+            counts.get("source_shipments", 0),
+            counts.get("valid_shipments", 0),
+            counts.get("quarantined_shipments", 0),
+            counts.get("inserted_orders", 0),
+            counts.get("updated_orders", 0),
+            status,
+        ))
+
+    logging.info(
+        "AUDIT: run_id=%s | status=%s registrado en la tabla %s",
+        run_id,
+        status,
+        config.audit_table,
+    )
+ 
+ 
+# ------------------------------------------- Función main_ETL() -------------------------------------------
 
 def main_ETL() -> None:
     config = load_config()
     run_id = str(uuid.uuid4())
     batch_id = f"ETL_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H:%M:%S')}"
-    watermark = read_watermark(config.watermark_path)
-    
+
+    started_at = pd.Timestamp.now("UTC").isoformat()
+    watermark_before = read_watermark(config.watermark_path)
+
     logging.info(
-            "=== ETL DEFINE/EXTRACT/STAGE iniciado | run_id= %s batch_id= %s ===",
-            run_id,
-            batch_id,
-        )
-    
-    logging.info(
-        "DEFINE: grain= %s | business_key= %s | refresh= %s | output= %s | thresholds= %s",
-        config.grain,
-        config.business_key,
-        config.refresh_strategy,
-        config.output_table,
-        config.quality_thresholds,
-    )
-    
-    logging.info("Watermark anterior: %s", watermark or "sin watermark")
-    
-    orders, shipments, carriers = extract(config, watermark)
-    staged_orders, staged_shipments, staged_carriers = stage(orders, shipments, carriers, batch_id)
-    
-    if staged_orders.empty:
-            logging.info("Sin pedidos nuevos o modificados")
-    else:
-        watermark_candidate = str(staged_orders["updated_at"].max())
-        logging.info(
-            "Watermark candidato= %s; se actualizará después de un LOAD exitoso",
-            watermark_candidate,
-        )
-    
-    print(
-        f"STAGE listo: orders={len(staged_orders)}, "
-        f"shipments={len(staged_shipments)}, carriers={len(staged_carriers)}")
-
-    valid_shipments, quarantined_shipments, reconciliation = validate(
-            staged_orders, staged_shipments, staged_carriers, config
-        )
-    
-    gate_result = quality_gate(reconciliation, config)
-    save_quarantine(quarantined_shipments, config)
-    
-    if gate_result["status"] == "FAIL":
-        raise SystemExit("Pipeline detenido: los umbrales de calidad fueron excedidos")
-    
-    transformed, selected = transform(valid_shipments)
-    orders_curated, reconciliation = integrate(
-        orders,
-        transformed,
-        selected,
-        carriers,
-        reconciliation,
-    )
-    
-    print("\nORDERS_CURATED")
-    print(orders_curated.to_string(index=False))
-    print("\nRECONCILIATION")
-    print(reconciliation)
-    print(f"\nCUARENTENA: {len(quarantined_shipments)} registro(s)")
-    
-    
-if __name__ == "__main__":
-    main_ETL()
-    
-"""
-def main() -> None:
-    config = load_config()
-    watermark = read_watermark(config.watermark_path)
-    orders, shipments, carriers = extract(config, watermark)
-    batch_id = f"TRANSFORM_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S')}"
-    orders, shipments, carriers = stage(
-        orders, shipments, carriers, batch_id
-    )
-    valid_shipments, quarantine, reconciliation = validate(
-        orders, shipments, carriers, config
-    )
-    transformed, selected = transform(valid_shipments)
-    orders_curated, reconciliation = integrate(
-        orders,
-        transformed,
-        selected,
-        carriers,
-        reconciliation,
+        "=== ETL iniciado | run_id= %s | batch_id= %s ===", run_id, batch_id
     )
 
-    print("\nORDERS_CURATED")
-    print(orders_curated.to_string(index=False))
-    print("\nRECONCILIATION")
-    print(reconciliation)
-    print(f"\nCUARENTENA: {len(quarantine)} registro(s)")
-
-
-if __name__ == "__main__":
-    main()
-
-"""
-
-    
-
-"""
-def main_validate() -> None:
-    config = load_config()
-    watermark = read_watermark(config.watermark_path)
-    orders, shipments, carriers = extract(config, watermark)
-    batch_id = f"VALIDATE_{pd.Timestamp.now('UTC').strftime('%Y%m%d_%H%M%S')}"
+    orders, shipments, carriers = extract(config, watermark_before)
     staged_orders, staged_shipments, staged_carriers = stage(
         orders, shipments, carriers, batch_id
     )
 
-    valid_shipments, quarantined_shipments, reconciliation = validate(
-        staged_orders, staged_shipments, staged_carriers, config
+    if staged_orders.empty:
+        
+        logging.info("Sin pedidos nuevos o modificados")
+        watermark_after = watermark_before
+        inserted, updated = 0, 0
+        valid_shipments, quarantined_shipments = pd.DataFrame(), pd.DataFrame()
+        
+    else:
+        
+        valid_shipments, quarantined_shipments, reconciliation = validate(
+            staged_orders, staged_shipments, staged_carriers, config
+        )
+        transformed, selected = transform(valid_shipments)
+        orders_curated, reconciliation = integrate(
+            staged_orders,
+            transformed,
+            selected,
+            staged_carriers,
+            reconciliation,
+        )
+
+        gate_result = quality_gate(reconciliation, config)
+        if gate_result["status"] == "FAIL":
+            raise SystemExit(
+                "Pipeline detenido: los umbrales de calidad fueron excedidos"
+            )
+
+        inserted, updated = load(
+            config, orders_curated, quarantined_shipments, batch_id
+        )
+
+        watermark_after = str(staged_orders["updated_at"].max())
+        write_watermark(config.watermark_path, watermark_after)
+
+    finished_at = pd.Timestamp.now("UTC").isoformat()
+    counts = {
+        "source_orders": len(staged_orders),
+        "source_shipments": len(staged_shipments),
+        "valid_shipments": len(valid_shipments),
+        "quarantined_shipments": len(quarantined_shipments),
+        "inserted_orders": inserted,
+        "updated_orders": updated,
+    }
+
+    audit(
+        config=config,
+        run_id=run_id,
+        started_at=started_at,
+        finished_at=finished_at,
+        watermark_before=watermark_before,
+        watermark_after=watermark_after,
+        counts=counts,
+        status="SUCCESS",
     )
-    gate_result = quality_gate(reconciliation, config)
-    save_quarantine(quarantined_shipments, config)
-
-    if gate_result["status"] == "FAIL":
-        raise SystemExit("Pipeline detenido: los umbrales de calidad fueron excedidos")
-
-    print(
-        f"VALIDATE listo: {len(valid_shipments)} filas válidas, "
-        f"{len(quarantined_shipments)} en cuarentena"
-    )
-
 
 if __name__ == "__main__":
-    main_validate()
-"""
+    main_ETL()
