@@ -36,6 +36,7 @@ class ETLConfig:
     carriers_path: Path
     watermark_path: Path
     output_table: str
+    audit_table: str
     grain: str
     business_key: str
     refresh_strategy: str
@@ -50,6 +51,7 @@ def load_config() -> ETLConfig:
         carriers_path=DATA_DIR / "carriers.json",
         watermark_path=DATA_DIR / "orders_watermark.json",
         output_table="orders_curated",
+        audit_table="etl_audit",
         grain="un pedido",
         business_key="order_id",
         refresh_strategy="incremental",
