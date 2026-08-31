@@ -2,26 +2,33 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo ">>> 0) Instalando dependencias (pandas)"
-pip install -q -r requirements.txt
+reset_watermark() {
+    python -c "import json; from pathlib import Path; p=Path('Data/orders_watermark.json'); p.write_text(json.dumps({'last_processed_updated_at': '1900-01-01T00:00:00'}, indent=2), encoding='utf-8')"
+}
+
+echo ">>> 0) Instalando dependencias"
+python -m pip install -q -r requirements.txt
 
 echo ""
-echo ">>> 1) Sembrando base fuente (data/vehicles.db)"
+echo ">>> 1) Sembrando las fuentes de la casuística A2 una sola vez"
 python seed_database.py
+reset_watermark
 
 echo ""
-echo ">>> 2) Primera corrida: bootstrap incremental (watermark inicial = 1900-01-01)"
-python etl_completo.py
-
-echo ""
-echo ">>> 3) Segunda corrida sin cambios: debe procesar 0 vehiculos nuevos (incremental correcto)"
-python etl_completo.py
-
-echo ""
-echo ">>> 4) Reset del watermark para simular un reprocesamiento del mismo batch (idempotencia)"
-python -c "import json,pathlib; p=pathlib.Path('data/watermark_state.json'); p.write_text(json.dumps({'last_processed_updated_at': '1900-01-01T00:00:00'}, indent=2))"
-python etl_completo.py
-
-echo ""
-echo ">>> 5) Verificacion: vehicles_curated debe seguir teniendo el mismo numero de filas que en la corrida 2"
+echo ">>> 2) Primera corrida con los datos iniciales"
+python ETL_orders.py
+echo ">>> SELECT COUNT(*) después de la primera corrida"
 python verify_etl.py
+
+echo ""
+echo ">>> 3) Segunda corrida con los mismos datos"
+echo "    Se reinicia solo el watermark; no se vuelve a sembrar la base."
+reset_watermark
+python ETL_orders.py
+echo ">>> SELECT COUNT(*) después de la segunda corrida"
+python verify_etl.py
+
+echo ""
+echo ">>> 4) Tercera corrida sin datos nuevos"
+python ETL_orders.py
+echo "    El pipeline debe mostrar 0 pedidos procesados por el watermark."

@@ -1,5 +1,4 @@
-"""Consulta vehicles_curated, etl_quarantine y etl_runs para inspeccionar
-el resultado del ETL completo."""
+"""Verifica el resultado e idempotencia del pipeline ETL de pedidos."""
 
 import json
 import sqlite3
@@ -7,26 +6,73 @@ from pathlib import Path
 
 import pandas as pd
 
+
 PROJECT_DIR = Path(__file__).resolve().parent
+DB_PATH = PROJECT_DIR / "Data" / "orders.db"
+WATERMARK_PATH = PROJECT_DIR / "Data" / "orders_watermark.json"
 
-with (PROJECT_DIR / "config.json").open(encoding="utf-8") as f:
-    config = json.load(f)
 
-db_path = PROJECT_DIR / config["database_path"]
-
-with sqlite3.connect(db_path) as conn:
-    print("\n=== vehicles_curated ===")
-    print(pd.read_sql(f"SELECT * FROM {config['output_table']} ORDER BY vehicle_id", conn).to_string(index=False))
-
-    print("\n=== etl_quarantine ===")
-    try:
-        print(pd.read_sql(f"SELECT * FROM {config['quarantine_table']}", conn).to_string(index=False))
-    except pd.errors.DatabaseError:
-        print("(tabla aun no existe)")
-
-    print("\n=== etl_runs (auditoria) ===")
-    print(
-        pd.read_sql(f"SELECT * FROM {config['audit_table']} ORDER BY started_at", conn).to_string(index=False)
+with sqlite3.connect(DB_PATH) as conn:
+    curated = pd.read_sql_query(
+        """
+        SELECT order_id, shipping_status, delivery_delay_days, carrier_name
+        FROM orders_curated
+        ORDER BY order_id
+        """,
+        conn,
     )
 
-print(f"\nWatermark actual: {json.load((PROJECT_DIR / config['watermark_path']).open(encoding='utf-8'))}")
+    total_rows = int(
+        conn.execute("SELECT COUNT(*) FROM orders_curated").fetchone()[0]
+    )
+    unique_orders = int(
+        conn.execute(
+            "SELECT COUNT(DISTINCT order_id) FROM orders_curated"
+        ).fetchone()[0]
+    )
+    duplicated_orders = conn.execute(
+        """
+        SELECT order_id, COUNT(*) AS occurrences
+        FROM orders_curated
+        GROUP BY order_id
+        HAVING COUNT(*) > 1
+        """
+    ).fetchall()
+
+    quarantine = pd.read_sql_query(
+        """
+        SELECT order_id, shipment_id, rejection_reason
+        FROM orders_quarantine
+        ORDER BY rowid
+        """,
+        conn,
+    )
+    audit = pd.read_sql_query(
+        """
+        SELECT run_id, status, source_orders, valid_shipments,
+               quarantined_shipments, inserted_orders, updated_orders
+        FROM etl_audit
+        ORDER BY started_at
+        """,
+        conn,
+    )
+
+if total_rows != unique_orders or duplicated_orders:
+    raise SystemExit(
+        f"ERROR: orders_curated contiene pedidos duplicados: {duplicated_orders}"
+    )
+
+print("\n=== orders_curated ===")
+print(curated.to_string(index=False))
+print(f"\nFilas totales: {total_rows}")
+print(f"Pedidos únicos: {unique_orders}")
+print("Duplicados por order_id: 0")
+
+print("\n=== orders_quarantine ===")
+print(quarantine.to_string(index=False))
+
+print("\n=== etl_audit ===")
+print(audit.to_string(index=False))
+
+print(f"\nWatermark actual: {json.loads(WATERMARK_PATH.read_text(encoding='utf-8'))}")
+print("\nVERIFICACIÓN OK: orders_curated no contiene duplicados por order_id.")

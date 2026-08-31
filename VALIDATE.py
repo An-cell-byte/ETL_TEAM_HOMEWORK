@@ -70,6 +70,17 @@ def validate(
     valid_shipments = shipments[shipments["rejection_reason"] == ""].copy()
     quarantined_shipments = shipments[shipments["rejection_reason"] != ""].copy()
 
+    if quarantined_shipments.empty:
+        logging.info("VALIDATE: no se enviaron registros a cuarentena")
+    else:
+        for _, rejected in quarantined_shipments.iterrows():
+            logging.info(
+                "VALIDATE: registro enviado a cuarentena | order_id=%s | shipment_id=%s | motivo=%s",
+                rejected.get("order_id"),
+                rejected.get("shipment_id"),
+                rejected["rejection_reason"],
+            )
+
     # Un transportista desconocido no invalida el paquete: se reporta para
     # reconciliation y se resolverá durante la integración.
     unknown_carrier_count = int(
